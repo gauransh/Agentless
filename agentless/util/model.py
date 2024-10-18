@@ -1,8 +1,57 @@
+import json
+import requests
+import logging
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Optional
 
 from agentless.util.api_requests import create_chatgpt_config, request_chatgpt_engine
 
+def call_ollama_api(content: str, model: str = 'mistral', temperature: float = 0.2, top_p: float = 1.0, max_tokens: Optional[int] = None) -> Optional[str]:
+    """Calls the Ollama API to generate a response based on the model."""
+    url = "http://localhost:11434/api/generate"
+    headers = {
+        "Content-Type": "application/json"
+    }
+    data = {
+        "model": model,
+        "prompt": content,
+        "stream": False,
+        "options": {
+            "temperature": temperature,
+            "top_p": top_p,
+        }
+    }
+    
+    if max_tokens is not None:
+        data["options"]["num_predict"] = max_tokens
+
+    logging.debug(f"Sending request to Ollama API with model: {model}, content: {content}")
+    try:
+        response = requests.post(url, headers=headers, data=json.dumps(data), stream=True)
+        response.raise_for_status()
+
+        full_response = ""
+        for line in response.iter_lines():
+            if line:
+                try:
+                    json_line = json.loads(line.decode('utf-8'))
+                    full_response += json_line.get("message", {}).get("content", "")
+                except json.JSONDecodeError as e:
+                    logging.error(f"Failed to decode JSON line: {e}")
+                    return None
+        
+        if not full_response.strip():
+            logging.error("Received an empty response from the API.")
+            return None
+
+        logging.info(f"Received full response from Ollama API: {full_response}")
+        return full_response
+    except requests.exceptions.RequestException as e:
+        logging.error(f"API request failed: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Unexpected error during API call: {e}")
+        return None
 
 class DecoderBase(ABC):
     def __init__(
@@ -34,7 +83,6 @@ class DecoderBase(ABC):
     def __str__(self) -> str:
         return self.name
 
-
 class OpenAIChatDecoder(DecoderBase):
     def __init__(self, name: str, logger, **kwargs) -> None:
         super().__init__(name, logger, **kwargs)
@@ -61,12 +109,6 @@ class OpenAIChatDecoder(DecoderBase):
             completion_tokens = 0
             prompt_tokens = 0
 
-        # The nice thing is, when we generate multiple samples from the same input (message),
-        # the input tokens are only charged once according to openai API.
-        # Therefore, we assume the request cost is only counted for the first sample.
-        # More specifically, the `prompt_tokens` is for one input message,
-        # and the `completion_tokens` is the sum of all returned completions.
-        # Therefore, for the second and later samples, the cost is zero.
         trajs = [
             {
                 "response": responses[0],
@@ -90,7 +132,6 @@ class OpenAIChatDecoder(DecoderBase):
 
     def is_direct_completion(self) -> bool:
         return False
-
 
 class DeepSeekChatDecoder(DecoderBase):
     def __init__(self, name: str, logger, **kwargs) -> None:
@@ -138,6 +179,47 @@ class DeepSeekChatDecoder(DecoderBase):
     def is_direct_completion(self) -> bool:
         return False
 
+class OllamaDecoder(DecoderBase):
+    def __init__(self, name: str, logger, **kwargs) -> None:
+        super().__init__(name, logger, **kwargs)
+
+    def codegen(self, message: str, num_samples: int = 1) -> List[dict]:
+        if self.temperature == 0:
+            assert num_samples == 1
+
+        trajs = []
+        for _ in range(num_samples):
+            response = call_ollama_api(
+                content=message,
+                model=self.name,
+                temperature=self.temperature,
+                max_tokens=self.max_new_tokens
+            )
+            if response:
+                trajs.append(
+                    {
+                        "response": response,
+                        "usage": {
+                            "completion_tokens": len(response.split()),  # Approximate token count
+                            "prompt_tokens": len(message.split()),  # Approximate token count
+                        },
+                    }
+                )
+            else:
+                trajs.append(
+                    {
+                        "response": "",
+                        "usage": {
+                            "completion_tokens": 0,
+                            "prompt_tokens": 0,
+                        },
+                    }
+                )
+
+        return trajs
+
+    def is_direct_completion(self) -> bool:
+        return False
 
 def make_model(
     model: str,
@@ -157,6 +239,14 @@ def make_model(
         )
     elif backend == "deepseek":
         return DeepSeekChatDecoder(
+            name=model,
+            logger=logger,
+            batch_size=batch_size,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+        )
+    elif backend == "ollama":
+        return OllamaDecoder(
             name=model,
             logger=logger,
             batch_size=batch_size,
