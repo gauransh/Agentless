@@ -326,7 +326,12 @@ def main():
         "--model",
         type=str,
         default="gpt-4o-2024-05-13",
-        choices=["gpt-4o-2024-05-13", "deepseek-coder", "gpt-4o-mini-2024-07-18"],
+        choices=[
+            "gpt-4o-2024-05-13",
+            "deepseek-coder",
+            "gpt-4o-mini-2024-07-18",
+            "llama3.1",
+        ],
     )
     parser.add_argument(
         "--backend",
